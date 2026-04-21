@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pendo": {
+      "command": "node",
+      "args": ["./mcp/pendo/server.js"],
+      "env": {
+        "PENDO_API_KEY": "${PENDO_API_KEY}"
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+# Node
+node_modules/
+dist/
+.env
+.env.local
+
+# Rust / Tauri
+UI/src-tauri/target/
+UI/src-tauri/WixTools/
+*.dmg
+*.app
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Secrets — never commit these
+**/.env
+**/secrets.json
+PENDO_API_KEY
