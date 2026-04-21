@@ -18,6 +18,20 @@ interface StreamPayload {
   is_error?: boolean;
 }
 
+function buildPromptWithHistory(messages: Message[], newPrompt: string): string {
+  if (messages.length === 0) return newPrompt;
+
+  const history = messages
+    .filter((m) => !m.streaming)
+    .map((m) => {
+      const role = m.role === "user" ? "User" : "Assistant";
+      return `${role}: ${m.content}`;
+    })
+    .join("\n\n");
+
+  return `Previous conversation:\n\n${history}\n\nUser: ${newPrompt}\n\nContinue the conversation, answering the latest user message. Do not repeat the conversation history.`;
+}
+
 export default function AgentChat({ agent }: { agent: Agent }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -26,6 +40,12 @@ export default function AgentChat({ agent }: { agent: Agent }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  const messagesRef = useRef<Message[]>([]);
+
+  // Keep ref in sync with state for use in callbacks
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -35,8 +55,8 @@ export default function AgentChat({ agent }: { agent: Agent }) {
     let mounted = true;
     listen<StreamPayload>("agent-stream", (event) => {
       if (!mounted) return;
-      const { session_id, chunk, done, is_error } = event.payload;
-      // if (session_id !== sessionId) return;
+      const { chunk, done, is_error } = event.payload;
+
       if (done) {
         setIsStreaming(false);
         setMessages((prev) =>
@@ -46,6 +66,7 @@ export default function AgentChat({ agent }: { agent: Agent }) {
         );
         return;
       }
+
       if (is_error) {
         setIsStreaming(false);
         setMessages((prev) => [
@@ -54,6 +75,7 @@ export default function AgentChat({ agent }: { agent: Agent }) {
         ]);
         return;
       }
+
       setMessages((prev) => {
         const existing = prev.find((m) => m.id === "streaming");
         if (existing) {
@@ -64,6 +86,7 @@ export default function AgentChat({ agent }: { agent: Agent }) {
         return [...prev, { id: "streaming", role: "agent", content: chunk, streaming: true }];
       });
     }).then((unlisten) => { unlistenRef.current = unlisten; });
+
     return () => {
       mounted = false;
       unlistenRef.current?.();
@@ -82,9 +105,20 @@ export default function AgentChat({ agent }: { agent: Agent }) {
     if (!text || isStreaming) return;
     setInput("");
     setIsStreaming(true);
-    setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: "user", content: text }]);
+
+    // Add user message to UI
+    const userMsg: Message = { id: `user-${Date.now()}`, role: "user", content: text };
+    setMessages((prev) => [...prev, userMsg]);
+
+    // Build prompt with conversation history
+    const promptWithHistory = buildPromptWithHistory(messagesRef.current, text);
+
     try {
-      await invoke("run_agent", { agentName: agent.configDir, prompt: text, sessionId });
+      await invoke("run_agent", {
+        agentName: agent.configDir,
+        prompt: promptWithHistory,
+        sessionId,
+      });
     } catch (err) {
       setIsStreaming(false);
       setMessages((prev) => [
