@@ -45,46 +45,141 @@ async function pendoPost(path, body) {
   return res.json();
 }
 
-function buildAggregation({ pipeline, timeSeries, rowsPerPage = 50 } = {}) {
-  const body = { response: { mimeType: "application/json" } };
-  if (timeSeries) body.timeSeries = timeSeries;
-  if (pipeline) body.request = { pipeline, requestId: `mcp-${Date.now()}` };
-  if (rowsPerPage) body.rowsPerPage = rowsPerPage;
-  return body;
+// Fixed: timeSeries must be a top-level key alongside request, not nested inside it
+function buildTimeSeriesAggregation({ source, filters = [], groupBy, fields, startDate, endDate, period, rowsPerPage = 50 }) {
+  const pipeline = [{ source }];
+  if (filters.length) filters.forEach(f => pipeline.push({ filter: f }));
+  if (groupBy || fields) {
+    pipeline.push({
+      group: {
+        group: groupBy || [],
+        fields: fields || [{ count: null, alias: "count" }]
+      }
+    });
+  }
+
+  return {
+    response: { mimeType: "application/json" },
+    // timeSeries at TOP level — this is the fix
+    timeSeries: {
+      period: period || "dayRange",
+      first: startDate,
+      last: endDate,
+    },
+    request: {
+      pipeline,
+      requestId: `mcp-${Date.now()}`,
+      sort: [{ field: "count", order: -1 }],
+    },
+    rowsPerPage,
+  };
 }
 
 const server = new McpServer({
   name: "pendo",
-  version: "1.0.0",
-  description: "Pendo product analytics",
+  version: "1.1.0",
+  description: "Pendo product analytics — features, pages, guides, NPS, segments, accounts",
 });
 
-server.tool("list_features", "List all tracked Pendo features.", { appId: z.string().optional() },
+server.tool("list_features", "List all tracked Pendo features. Use appId=-323232 for SOCi.",
+  { appId: z.string().optional() },
   async ({ appId }) => {
     const data = await pendoGet("/feature", appId ? { appId } : {});
     const features = Array.isArray(data) ? data : Object.values(data);
-    const rows = features.slice(0, 100).map((f) => ({ id: f.id, name: f.name, appId: f.appId, kind: f.kind }));
+    const rows = features.slice(0, 100).map((f) => ({
+      id: f.id, name: f.name, appId: f.appId, kind: f.kind,
+    }));
     return { content: [{ type: "text", text: JSON.stringify({ total: features.length, features: rows }, null, 2) }] };
   }
 );
 
-server.tool("get_feature_adoption", "Get adoption metrics for a Pendo feature.",
-  { featureId: z.string(), startDate: z.string(), endDate: z.string(), granularity: z.enum(["daily","weekly","monthly"]).default("daily") },
+server.tool("get_feature_adoption",
+  "Get adoption metrics for a Pendo feature over a date range. Returns clicks and unique visitors per day/week/month.",
+  {
+    featureId: z.string().describe("Pendo feature ID"),
+    startDate: z.string().describe("Start date YYYY-MM-DD"),
+    endDate: z.string().describe("End date YYYY-MM-DD"),
+    granularity: z.enum(["daily", "weekly", "monthly"]).default("daily"),
+  },
   async ({ featureId, startDate, endDate, granularity }) => {
-    const granMap = { daily: "dayRange", weekly: "weekRange", monthly: "monthRange" };
-    const body = buildAggregation({
-      pipeline: [
-        { source: { featureEvents: { featureId } } },
-        { group: { group: ["visitorId", "accountId", "day"], fields: [{ count: null, alias: "numEvents" }] } },
-      ],
-      timeSeries: { period: granMap[granularity], first: startDate, last: endDate },
-    });
+    const periodMap = { daily: "dayRange", weekly: "weekRange", monthly: "monthRange" };
+
+    // Fixed aggregation structure
+    const body = {
+      response: { mimeType: "application/json" },
+      timeSeries: {
+        period: periodMap[granularity],
+        first: startDate,
+        last: endDate,
+      },
+      request: {
+        pipeline: [
+          { source: { featureEvents: { featureId } } },
+          {
+            group: {
+              group: ["visitorId", "accountId"],
+              fields: [
+                { count: null, alias: "numClicks" },
+              ],
+            },
+          },
+        ],
+        requestId: `feature-adoption-${Date.now()}`,
+      },
+      rowsPerPage: 500,
+    };
+
     const data = await pendoPost("/aggregation", body);
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 );
 
-server.tool("list_pages", "List all tracked Pendo pages.", { appId: z.string().optional() },
+server.tool("get_top_features",
+  "Get the most-used features by total clicks in a date range. Best tool for ranking feature usage.",
+  {
+    startDate: z.string().describe("Start date YYYY-MM-DD"),
+    endDate: z.string().describe("End date YYYY-MM-DD"),
+    appId: z.string().optional().describe("App ID — use -323232 for SOCi"),
+    limit: z.number().int().min(1).max(100).default(20),
+  },
+  async ({ startDate, endDate, appId, limit }) => {
+    const pipeline = [
+      { source: { featureEvents: appId ? { appId } : null } },
+      {
+        group: {
+          group: ["featureId"],
+          fields: [
+            { count: null, alias: "totalClicks" },
+            { countDistinct: "visitorId", alias: "uniqueVisitors" },
+            { countDistinct: "accountId", alias: "uniqueAccounts" },
+          ],
+        },
+      },
+      { sort: { field: "totalClicks", order: -1 } },
+      { limit },
+    ];
+
+    const body = {
+      response: { mimeType: "application/json" },
+      timeSeries: {
+        period: "dayRange",
+        first: startDate,
+        last: endDate,
+      },
+      request: {
+        pipeline,
+        requestId: `top-features-${Date.now()}`,
+      },
+      rowsPerPage: limit,
+    };
+
+    const data = await pendoPost("/aggregation", body);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  }
+);
+
+server.tool("list_pages", "List all tracked Pendo pages.",
+  { appId: z.string().optional() },
   async ({ appId }) => {
     const data = await pendoGet("/page", appId ? { appId } : {});
     const pages = Array.isArray(data) ? data : Object.values(data);
@@ -93,23 +188,43 @@ server.tool("list_pages", "List all tracked Pendo pages.", { appId: z.string().o
   }
 );
 
-server.tool("get_page_analytics", "Get page view metrics for a Pendo page.",
-  { pageId: z.string(), startDate: z.string(), endDate: z.string(), granularity: z.enum(["daily","weekly","monthly"]).default("daily") },
+server.tool("get_page_analytics", "Get page view metrics for a date range.",
+  {
+    pageId: z.string(),
+    startDate: z.string(),
+    endDate: z.string(),
+    granularity: z.enum(["daily", "weekly", "monthly"]).default("daily"),
+  },
   async ({ pageId, startDate, endDate, granularity }) => {
-    const granMap = { daily: "dayRange", weekly: "weekRange", monthly: "monthRange" };
-    const body = buildAggregation({
-      pipeline: [
-        { source: { pageEvents: { pageId } } },
-        { group: { group: ["visitorId", "accountId", "day"], fields: [{ count: null, alias: "numViews" }] } },
-      ],
-      timeSeries: { period: granMap[granularity], first: startDate, last: endDate },
-    });
+    const periodMap = { daily: "dayRange", weekly: "weekRange", monthly: "monthRange" };
+    const body = {
+      response: { mimeType: "application/json" },
+      timeSeries: {
+        period: periodMap[granularity],
+        first: startDate,
+        last: endDate,
+      },
+      request: {
+        pipeline: [
+          { source: { pageEvents: { pageId } } },
+          {
+            group: {
+              group: ["visitorId", "accountId"],
+              fields: [{ count: null, alias: "numViews" }],
+            },
+          },
+        ],
+        requestId: `page-analytics-${Date.now()}`,
+      },
+      rowsPerPage: 500,
+    };
     const data = await pendoPost("/aggregation", body);
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 );
 
-server.tool("list_guides", "List all Pendo in-app guides.", { state: z.enum(["public","staged","draft","disabled"]).optional() },
+server.tool("list_guides", "List all Pendo in-app guides.",
+  { state: z.enum(["public", "staged", "draft", "disabled"]).optional() },
   async ({ state }) => {
     const data = await pendoGet("/guide");
     const guides = Array.isArray(data) ? data : Object.values(data);
@@ -122,13 +237,26 @@ server.tool("list_guides", "List all Pendo in-app guides.", { state: z.enum(["pu
 server.tool("get_guide_metrics", "Get display and completion metrics for a Pendo guide.",
   { guideId: z.string(), startDate: z.string(), endDate: z.string() },
   async ({ guideId, startDate, endDate }) => {
-    const body = buildAggregation({
-      pipeline: [
-        { source: { guideEvents: { guideId } } },
-        { group: { group: ["type"], fields: [{ count: null, alias: "count" }, { countDistinct: "visitorId", alias: "uniqueVisitors" }] } },
-      ],
+    const body = {
+      response: { mimeType: "application/json" },
       timeSeries: { period: "dayRange", first: startDate, last: endDate },
-    });
+      request: {
+        pipeline: [
+          { source: { guideEvents: { guideId } } },
+          {
+            group: {
+              group: ["type"],
+              fields: [
+                { count: null, alias: "count" },
+                { countDistinct: "visitorId", alias: "uniqueVisitors" },
+              ],
+            },
+          },
+        ],
+        requestId: `guide-metrics-${Date.now()}`,
+      },
+      rowsPerPage: 100,
+    };
     const data = await pendoPost("/aggregation", body);
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
@@ -148,7 +276,11 @@ server.tool("list_accounts", "List Pendo accounts with optional filtering.",
   async ({ limit, filter }) => {
     const pipeline = [{ source: { accounts: null } }];
     if (filter) pipeline.push({ filter });
-    const body = buildAggregation({ pipeline, rowsPerPage: limit });
+    const body = {
+      response: { mimeType: "application/json" },
+      request: { pipeline, requestId: `accounts-${Date.now()}` },
+      rowsPerPage: limit,
+    };
     const data = await pendoPost("/aggregation", body);
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
@@ -163,25 +295,60 @@ server.tool("get_account_details", "Get full details for a specific Pendo accoun
 );
 
 server.tool("get_nps_data", "Get NPS survey responses and trends.",
-  { startDate: z.string(), endDate: z.string(), granularity: z.enum(["daily","weekly","monthly"]).default("monthly") },
+  {
+    startDate: z.string(),
+    endDate: z.string(),
+    granularity: z.enum(["daily", "weekly", "monthly"]).default("monthly"),
+  },
   async ({ startDate, endDate, granularity }) => {
-    const granMap = { daily: "dayRange", weekly: "weekRange", monthly: "monthRange" };
-    const body = buildAggregation({
-      pipeline: [
-        { source: { pollSubmissions: null } },
-        { group: { group: ["rating"], fields: [{ count: null, alias: "responses" }, { countDistinct: "visitorId", alias: "uniqueRespondents" }] } },
-      ],
-      timeSeries: { period: granMap[granularity], first: startDate, last: endDate },
-    });
+    const periodMap = { daily: "dayRange", weekly: "weekRange", monthly: "monthRange" };
+    const body = {
+      response: { mimeType: "application/json" },
+      timeSeries: {
+        period: periodMap[granularity],
+        first: startDate,
+        last: endDate,
+      },
+      request: {
+        pipeline: [
+          { source: { pollSubmissions: null } },
+          {
+            group: {
+              group: ["rating"],
+              fields: [
+                { count: null, alias: "responses" },
+                { countDistinct: "visitorId", alias: "uniqueRespondents" },
+              ],
+            },
+          },
+        ],
+        requestId: `nps-${Date.now()}`,
+      },
+      rowsPerPage: 100,
+    };
     const data = await pendoPost("/aggregation", body);
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
 );
 
-server.tool("run_aggregation", "Run a raw Pendo aggregation pipeline for custom metrics.",
-  { pipeline: z.array(z.record(z.unknown())), timeSeries: z.record(z.unknown()).optional(), rowsPerPage: z.number().int().default(100) },
-  async ({ pipeline, timeSeries, rowsPerPage }) => {
-    const body = buildAggregation({ pipeline, timeSeries, rowsPerPage });
+server.tool("run_aggregation", "Run a raw Pendo aggregation. timeSeries is optional for event sources.",
+  {
+    pipeline: z.array(z.record(z.unknown())),
+    startDate: z.string().optional().describe("Required for time-series sources like featureEvents, pageEvents"),
+    endDate: z.string().optional().describe("Required for time-series sources"),
+    period: z.enum(["dayRange", "weekRange", "monthRange"]).optional().default("dayRange"),
+    rowsPerPage: z.number().int().default(100),
+  },
+  async ({ pipeline, startDate, endDate, period, rowsPerPage }) => {
+    const body = {
+      response: { mimeType: "application/json" },
+      request: { pipeline, requestId: `raw-${Date.now()}` },
+      rowsPerPage,
+    };
+    // Only add timeSeries if dates provided
+    if (startDate && endDate) {
+      body.timeSeries = { period: period || "dayRange", first: startDate, last: endDate };
+    }
     const data = await pendoPost("/aggregation", body);
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   }
@@ -189,4 +356,4 @@ server.tool("run_aggregation", "Run a raw Pendo aggregation pipeline for custom 
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[pendo-mcp] Server running on stdio");
+console.error("[pendo-mcp] Server v1.1.0 running on stdio");

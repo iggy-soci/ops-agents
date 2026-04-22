@@ -20,53 +20,74 @@ interface StreamPayload {
 
 function buildPromptWithHistory(messages: Message[], newPrompt: string): string {
   if (messages.length === 0) return newPrompt;
-
   const history = messages
     .filter((m) => !m.streaming)
-    .map((m) => {
-      const role = m.role === "user" ? "User" : "Assistant";
-      return `${role}: ${m.content}`;
-    })
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
     .join("\n\n");
-
   return `Previous conversation:\n\n${history}\n\nUser: ${newPrompt}\n\nContinue the conversation, answering the latest user message. Do not repeat the conversation history.`;
+}
+
+function ThinkingIndicator({ elapsed, emoji }: { elapsed: number; emoji: string }) {
+  return (
+    <div className="message message--agent">
+      <div className="message__avatar message__avatar--agent">{emoji}</div>
+      <div className="message__body">
+        <div className="message__role">Agent</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", gap: 4 }}>
+            {[0, 1, 2].map((i) => (
+              <div key={i} style={{
+                width: 6, height: 6, borderRadius: "50%",
+                background: "var(--accent)",
+                animation: `bounce 1.2s ease-in-out ${i * 0.2}s infinite`,
+              }} />
+            ))}
+          </div>
+          <span style={{ fontSize: 12, color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>
+            {elapsed < 5 ? "Thinking..." : elapsed < 15 ? `Working on it... ${Math.floor(elapsed)}s` : `Still processing... ${Math.floor(elapsed)}s`}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function AgentChat({ agent }: { agent: Agent }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const [sessionId] = useState(() => `${agent.id}-${Date.now()}`);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
   const messagesRef = useRef<Message[]>([]);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Keep ref in sync with state for use in callbacks
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, isStreaming]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    if (isStreaming) {
+      setElapsed(0);
+      timerRef.current = setInterval(() => setElapsed((e) => e + 0.1), 100);
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current);
+      setElapsed(0);
+    }
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [isStreaming]);
 
   useEffect(() => {
     let mounted = true;
     listen<StreamPayload>("agent-stream", (event) => {
       if (!mounted) return;
       const { chunk, done, is_error } = event.payload;
-
       if (done) {
         setIsStreaming(false);
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === "streaming" ? { ...m, id: `msg-${Date.now()}`, streaming: false } : m
-          )
-        );
+        setMessages((prev) => prev.map((m) => m.id === "streaming" ? { ...m, id: `msg-${Date.now()}`, streaming: false } : m));
         return;
       }
-
       if (is_error) {
         setIsStreaming(false);
         setMessages((prev) => [
@@ -75,22 +96,13 @@ export default function AgentChat({ agent }: { agent: Agent }) {
         ]);
         return;
       }
-
       setMessages((prev) => {
         const existing = prev.find((m) => m.id === "streaming");
-        if (existing) {
-          return prev.map((m) =>
-            m.id === "streaming" ? { ...m, content: m.content + chunk } : m
-          );
-        }
+        if (existing) return prev.map((m) => m.id === "streaming" ? { ...m, content: m.content + chunk } : m);
         return [...prev, { id: "streaming", role: "agent", content: chunk, streaming: true }];
       });
     }).then((unlisten) => { unlistenRef.current = unlisten; });
-
-    return () => {
-      mounted = false;
-      unlistenRef.current?.();
-    };
+    return () => { mounted = false; unlistenRef.current?.(); };
   }, [sessionId]);
 
   useEffect(() => {
@@ -105,20 +117,11 @@ export default function AgentChat({ agent }: { agent: Agent }) {
     if (!text || isStreaming) return;
     setInput("");
     setIsStreaming(true);
-
-    // Add user message to UI
     const userMsg: Message = { id: `user-${Date.now()}`, role: "user", content: text };
     setMessages((prev) => [...prev, userMsg]);
-
-    // Build prompt with conversation history
     const promptWithHistory = buildPromptWithHistory(messagesRef.current, text);
-
     try {
-      await invoke("run_agent", {
-        agentName: agent.configDir,
-        prompt: promptWithHistory,
-        sessionId,
-      });
+      await invoke("run_agent", { agentName: agent.configDir, prompt: promptWithHistory, sessionId });
     } catch (err) {
       setIsStreaming(false);
       setMessages((prev) => [
@@ -129,30 +132,28 @@ export default function AgentChat({ agent }: { agent: Agent }) {
   }, [input, isStreaming, agent.configDir, sessionId]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   };
 
-  const sendSuggestion = (s: string) => {
-    setInput(s);
-    setTimeout(() => send(), 50);
-  };
+  const sendSuggestion = (s: string) => { setInput(s); setTimeout(() => send(), 50); };
 
   return (
     <div className="agent-container">
+      <style>{`
+        @keyframes bounce {
+          0%, 60%, 100% { transform: translateY(0); }
+          30% { transform: translateY(-6px); }
+        }
+      `}</style>
       <div className="messages">
-        {messages.length === 0 && (
+        {messages.length === 0 && !isStreaming && (
           <div className="welcome">
             <div className="welcome__agent">{agent.emoji}</div>
             <div className="welcome__title">{agent.label}</div>
             <p style={{ fontSize: 13, color: "var(--text-tertiary)" }}>{agent.description}</p>
             <div className="welcome__chips">
               {agent.suggestions.map((s) => (
-                <button key={s} className="welcome__chip" onClick={() => sendSuggestion(s)}>
-                  {s}
-                </button>
+                <button key={s} className="welcome__chip" onClick={() => sendSuggestion(s)}>{s}</button>
               ))}
             </div>
           </div>
@@ -160,6 +161,7 @@ export default function AgentChat({ agent }: { agent: Agent }) {
         {messages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} agentEmoji={agent.emoji} />
         ))}
+        {isStreaming && <ThinkingIndicator elapsed={elapsed} emoji={agent.emoji} />}
         <div ref={messagesEndRef} />
       </div>
       <div className="input-bar">
@@ -170,7 +172,7 @@ export default function AgentChat({ agent }: { agent: Agent }) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={`Ask ${agent.label}...`}
+            placeholder={isStreaming ? "Agent is thinking..." : `Ask ${agent.label}...`}
             rows={1}
             disabled={isStreaming}
           />
@@ -181,12 +183,14 @@ export default function AgentChat({ agent }: { agent: Agent }) {
               </svg>
             ) : (
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                <path d="M7 2L12 7L7 12M2 7H12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M7 2L12 7L7 12M2 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             )}
           </button>
         </div>
-        <div className="input-hint">Enter to send · Shift+Enter for new line</div>
+        <div className="input-hint">
+          {isStreaming ? `Processing... ${Math.floor(elapsed)}s` : "Enter to send · Shift+Enter for new line"}
+        </div>
       </div>
     </div>
   );
